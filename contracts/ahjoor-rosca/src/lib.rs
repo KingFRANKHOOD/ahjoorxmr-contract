@@ -1347,12 +1347,133 @@ impl AhjoorContract {
             .instance()
             .set(&DataKey::SuspendedMembers, &suspended_members);
 
+        // ── #224: Cycle completion bonus ──────────────────────────────────────
+        // A cycle ends when (current_round + 1) is a multiple of payout_order.len().
+        let payout_order: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PayoutOrder)
+            .unwrap_or(Vec::new(&env));
+        let cycle_len = payout_order.len() as u32;
+        if cycle_len > 0 && (current_round + 1) % cycle_len == 0 {
+            let bonus_amount: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey2::CycleBonusAmount)
+                .unwrap_or(0);
+            if bonus_amount > 0 {
+                let cycle_number = (current_round + 1) / cycle_len;
+                let cycle_start = (cycle_number - 1) * cycle_len;
+                let mut qualifying: Vec<Address> = Vec::new(&env);
+                for member in members.iter() {
+                    if exited_members.contains(&member) { continue; }
+                    let defaults = default_count.get(member.clone()).unwrap_or(0);
+                    let mut had_skip = false;
+                    for r in cycle_start..=(current_round) {
+                        if skip_requests.get((member.clone(), r)).unwrap_or(false) {
+                            had_skip = true;
+                            break;
+                        }
+                    }
+                    if defaults == 0 && !had_skip {
+                        qualifying.push_back(member);
+                    }
+                }
+                let q_count = qualifying.len() as i128;
+                if q_count > 0 {
+                    let total_needed = bonus_amount * q_count;
+                    let mut reward_pool: i128 = env
+                        .storage()
+                        .instance()
+                        .get(&DataKey::RewardPool)
+                        .unwrap_or(0);
+                    let actual_bonus = if reward_pool >= total_needed {
+                        bonus_amount
+                    } else if reward_pool > 0 {
+                        let prorated = reward_pool / q_count;
+                        let shortfall = total_needed - reward_pool;
+                        events::emit_cycle_bonus_prorated(&env, cycle_number, shortfall);
+                        prorated
+                    } else {
+                        0
+                    };
+                    if actual_bonus > 0 {
+                        let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+                        let token_client = token::Client::new(&env, &token_addr);
+                        for member in qualifying.iter() {
+                            token_client.transfer(
+                                &env.current_contract_address(),
+                                &member,
+                                &actual_bonus,
+                            );
+                            reward_pool -= actual_bonus;
+                            events::emit_cycle_bonus_paid(&env, member, actual_bonus, cycle_number);
+                        }
+                        env.storage().instance().set(&DataKey::RewardPool, &reward_pool);
+                    }
+                }
+            }
+        }
+
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
-    pub fn penalise_defaulter(env: Env, member: Address) {
+    // ─── #224: Cycle Completion Bonus ────────────────────────────────────────
+
+    /// Admin sets the per-member cycle completion bonus drawn from the reward pool.
+    pub fn set_cycle_bonus(env: Env, admin: Address, amount: i128) {
+        internals::check_not_paused(&env);
+        admin.require_auth();
+        let a: Address = env.storage().instance().get(&DataKey::Admin).expect("No admin");
+        if admin != a { panic_with_error!(&env, Error::OnlyAdminAllowed); }
+        if amount < 0 { panic_with_error!(&env, Error::AmountMustBePositive); }
+        env.storage().instance().set(&DataKey2::CycleBonusAmount, &amount);
+        events::emit_cycle_bonus_configured(&env, amount);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Returns the configured cycle bonus amount (0 if not set).
+    pub fn get_cycle_bonus(env: Env) -> i128 {
+        env.storage().instance().get(&DataKey2::CycleBonusAmount).unwrap_or(0)
+    }
+
+    // ─── #227: Round Duration Update ─────────────────────────────────────────
+
+    /// Admin schedules a round duration change that takes effect from the next round.
+    /// `new_duration_seconds` must be within [min_round_duration, max_round_duration].
+    pub fn update_round_duration(env: Env, admin: Address, new_duration_seconds: u64) {
+        internals::check_not_paused(&env);
+        admin.require_auth();
+        let a: Address = env.storage().instance().get(&DataKey::Admin).expect("No admin");
+        if admin != a { panic_with_error!(&env, Error::OnlyAdminAllowed); }
+
+        let min_dur: u64 = env.storage().instance().get(&DataKey2::MinRoundDuration).unwrap_or(60);
+        let max_dur: u64 = env.storage().instance().get(&DataKey2::MaxRoundDuration).unwrap_or(u64::MAX);
+        if new_duration_seconds < min_dur || new_duration_seconds > max_dur {
+            panic_with_error!(&env, Error::RoundDurationOutOfBounds);
+        }
+
+        let old_duration: u64 = env.storage().instance().get(&DataKey::RoundDuration).unwrap_or(0);
+        let current_round: u32 = env.storage().instance().get(&DataKey::CurrentRound).unwrap_or(0);
+
+        env.storage().instance().set(&DataKey2::PendingRoundDuration, &new_duration_seconds);
+        events::emit_round_duration_update_scheduled(&env, old_duration, new_duration_seconds, current_round + 1);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Admin configures the min/max bounds for round duration.
+    pub fn set_round_duration_bounds(env: Env, admin: Address, min_seconds: u64, max_seconds: u64) {
+        internals::check_not_paused(&env);
+        admin.require_auth();
+        let a: Address = env.storage().instance().get(&DataKey::Admin).expect("No admin");
+        if admin != a { panic_with_error!(&env, Error::OnlyAdminAllowed); }
+        if min_seconds == 0 || min_seconds > max_seconds { panic_with_error!(&env, Error::InvalidAmount); }
+        env.storage().instance().set(&DataKey2::MinRoundDuration, &min_seconds);
+        env.storage().instance().set(&DataKey2::MaxRoundDuration, &max_seconds);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
         internals::check_not_paused(&env);
         let admin: Address = env
             .storage()
@@ -4842,6 +4963,185 @@ impl AhjoorContract {
             .get(&DataKey2::CatchUpDebt)
             .unwrap_or(Map::new(&env));
         debts.get(member).unwrap_or(0)
+    }
+
+    // ─── #230: ROSCA Group Merge ──────────────────────────────────────────────
+
+    /// Admin of this group (Group A) proposes a merge with Group B.
+    /// `group_b_id` is an external identifier for the other group.
+    /// Returns the merge proposal ID.
+    pub fn propose_merge(env: Env, admin: Address, group_b_id: u32) -> u32 {
+        internals::check_not_paused(&env);
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        if admin != stored_admin {
+            panic_with_error!(&env, Error::OnlyAdminAllowed);
+        }
+
+        // Cannot merge a dissolved or already-merged group
+        let group_status: GroupStatus = env
+            .storage()
+            .instance()
+            .get(&DataKey2::GroupStatus)
+            .unwrap_or(GroupStatus::Active);
+        if group_status != GroupStatus::Active {
+            panic!("Group is not active");
+        }
+
+        // Merges are only permitted between rounds (PaidMembers must be empty)
+        let paid_members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaidMembers)
+            .unwrap_or(Vec::new(&env));
+        if !paid_members.is_empty() {
+            panic!("Merge only permitted between rounds");
+        }
+
+        let proposal_id: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey2::MergeProposalCounter)
+            .unwrap_or(0) + 1;
+        env.storage()
+            .instance()
+            .set(&DataKey2::MergeProposalCounter, &proposal_id);
+
+        let proposal = MergeProposal {
+            id: proposal_id,
+            group_a_admin: admin.clone(),
+            group_b_id,
+            proposed_at: env.ledger().timestamp(),
+            accepted: false,
+        };
+
+        let mut proposals: Map<u32, MergeProposal> = env
+            .storage()
+            .instance()
+            .get(&DataKey2::MergeProposals)
+            .unwrap_or(Map::new(&env));
+        proposals.set(proposal_id, proposal);
+        env.storage()
+            .instance()
+            .set(&DataKey2::MergeProposals, &proposals);
+
+        events::emit_merge_proposed(&env, proposal_id, admin, group_b_id);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        proposal_id
+    }
+
+    /// Admin accepts a merge proposal and executes the merge.
+    /// `new_members` is the list of Group B's members to append to this group's payout order.
+    /// `group_b_balance` is the amount of tokens transferred from Group B (caller must have
+    /// already transferred the tokens to this contract before calling).
+    pub fn accept_merge(
+        env: Env,
+        admin: Address,
+        merge_proposal_id: u32,
+        new_members: Vec<Address>,
+    ) {
+        internals::check_not_paused(&env);
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        if admin != stored_admin {
+            panic_with_error!(&env, Error::OnlyAdminAllowed);
+        }
+
+        let mut proposals: Map<u32, MergeProposal> = env
+            .storage()
+            .instance()
+            .get(&DataKey2::MergeProposals)
+            .unwrap_or(Map::new(&env));
+        let mut proposal = proposals.get(merge_proposal_id).expect("Merge proposal not found");
+
+        if proposal.accepted {
+            panic!("Merge proposal already accepted");
+        }
+
+        // Merges are only permitted between rounds
+        let paid_members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaidMembers)
+            .unwrap_or(Vec::new(&env));
+        if !paid_members.is_empty() {
+            panic!("Merge only permitted between rounds");
+        }
+
+        let max_members: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxMembers)
+            .unwrap_or(50);
+
+        let mut members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Members)
+            .expect("Not initialized");
+
+        let combined_count = members.len() as u32 + new_members.len() as u32;
+        if combined_count > max_members {
+            panic!("Combined member count exceeds max_members");
+        }
+
+        let mut payout_order: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PayoutOrder)
+            .expect("Not initialized");
+
+        // Append Group B's members after Group A's remaining members
+        for m in new_members.iter() {
+            if !members.contains(&m) {
+                members.push_back(m.clone());
+                payout_order.push_back(m.clone());
+            }
+        }
+
+        env.storage().instance().set(&DataKey::Members, &members);
+        env.storage().instance().set(&DataKey::PayoutOrder, &payout_order);
+
+        // Mark Group B as merged
+        env.storage()
+            .instance()
+            .set(&DataKey2::GroupMergedInto, &proposal.group_b_id);
+
+        proposal.accepted = true;
+        proposals.set(merge_proposal_id, proposal.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey2::MergeProposals, &proposals);
+
+        events::emit_merge_accepted(&env, merge_proposal_id);
+        events::emit_merge_completed(&env, merge_proposal_id, new_members.len() as u32);
+        events::emit_group_marked_merged(&env, proposal.group_b_id);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Get a merge proposal by ID.
+    pub fn get_merge_proposal(env: Env, proposal_id: u32) -> MergeProposal {
+        let proposals: Map<u32, MergeProposal> = env
+            .storage()
+            .instance()
+            .get(&DataKey2::MergeProposals)
+            .unwrap_or(Map::new(&env));
+        proposals.get(proposal_id).expect("Merge proposal not found")
     }
 }
 

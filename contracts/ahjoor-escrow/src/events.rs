@@ -256,6 +256,34 @@ pub struct BuyerRoleTransferred {
     pub new_buyer: Address,
 }
 
+/// Event: Dispute resolution entered cooling-off state
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct ResolutionCoolingOff {
+    pub escrow_id: u32,
+    pub buyer_percent: u32,
+    pub arbiter: Address,
+    pub cooling_off_ends_at: u64,
+}
+
+/// Event: Resolution error flagged by a party during cooling-off
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct ResolutionFlagged {
+    pub escrow_id: u32,
+    pub flagger: Address,
+    pub reason_hash: BytesN<32>,
+}
+
+/// Event: Resolution finalized and funds released
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct ResolutionFinalized {
+    pub escrow_id: u32,
+    pub buyer_percent: u32,
+    pub finalized_by: Address,
+}
+
 // --- Helper Emission Functions ---
 
 pub fn emit_escrow_created(
@@ -731,6 +759,40 @@ pub fn emit_arbiter_timeout_penalty_applied(e: &Env, arbiter: Address, total_tim
     ArbiterTimeoutPenaltyApplied {
         arbiter,
         total_timeouts,
+    }
+    .publish(e);
+}
+
+pub fn emit_resolution_cooling_off(
+    e: &Env,
+    escrow_id: u32,
+    buyer_percent: u32,
+    arbiter: Address,
+    cooling_off_ends_at: u64,
+) {
+    ResolutionCoolingOff {
+        escrow_id,
+        buyer_percent,
+        arbiter,
+        cooling_off_ends_at,
+    }
+    .publish(e);
+}
+
+pub fn emit_resolution_flagged(e: &Env, escrow_id: u32, flagger: Address, reason_hash: BytesN<32>) {
+    ResolutionFlagged {
+        escrow_id,
+        flagger,
+        reason_hash,
+    }
+    .publish(e);
+}
+
+pub fn emit_resolution_finalized(e: &Env, escrow_id: u32, buyer_percent: u32, finalized_by: Address) {
+    ResolutionFinalized {
+        escrow_id,
+        buyer_percent,
+        finalized_by,
     }
     .publish(e);
 }

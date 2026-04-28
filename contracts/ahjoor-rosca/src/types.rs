@@ -233,6 +233,9 @@ pub enum DataKey2 {
     DissolutionVotes,        // Map<(u32, Address), bool> — (round, voter)
     DissolutionVoteCount,    // Map<u32, i128> — (round, votes_for)
     DissolutionDeadline,     // Map<u32, u64> — (round, deadline)
+    // Waitlist
+    Waitlist,                // Vec<(Address, u64)> — (address, joined_at)
+    CatchUpDebt,             // Map<Address, i128> — pending catch-up amounts
 }
 
 /// Persistent storage keys — kept separate because DataKey was hitting

@@ -1008,3 +1008,38 @@ pub fn emit_member_refunded(e: &Env, member: Address, amount: i128, contribution
 pub fn emit_dissolution_config_updated(e: &Env, dissolution_quorum_bps: u32, vote_window_seconds: u64) {
     DissolutionConfigUpdated { dissolution_quorum_bps, vote_window_seconds }.publish(e);
 }
+
+// --- Waitlist Events ---
+
+/// Event: Address joined the waitlist
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct WaitlistUpdated {
+    pub address: Address,
+    pub joined: bool, // true = joined, false = removed
+    pub waitlist_size: u32,
+}
+
+/// Event: Waitlisted member auto-enrolled on vacancy
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct MemberEnrolledFromWaitlist {
+    pub new_member: Address,
+    pub vacated_by: Address,
+    pub round: u32,
+    pub catch_up_amount: i128,
+}
+
+pub fn emit_waitlist_updated(e: &Env, address: Address, joined: bool, waitlist_size: u32) {
+    WaitlistUpdated { address, joined, waitlist_size }.publish(e);
+}
+
+pub fn emit_member_enrolled_from_waitlist(
+    e: &Env,
+    new_member: Address,
+    vacated_by: Address,
+    round: u32,
+    catch_up_amount: i128,
+) {
+    MemberEnrolledFromWaitlist { new_member, vacated_by, round, catch_up_amount }.publish(e);
+}

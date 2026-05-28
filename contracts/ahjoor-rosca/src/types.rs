@@ -284,6 +284,7 @@ pub enum DataKey2 {
 #[contracttype]
 pub enum DataKey3 {
     CoSignerWindowStart,     // Map<Address, u32> — member → ledger when window opened (#240)
+    ProxyAuthorizations,     // Map<(u32, Address), ProxyAuthorization> — (group_id, member)
     IsFrozen,                // bool — group is frozen by contract-level admin (#236)
     // #267: Tiered Contribution Levels
     GroupTiers,              // Vec<Tier> — named tier definitions
@@ -347,6 +348,14 @@ pub enum CoSignerStatus {
 pub struct CoSignerRecord {
     pub co_signer: Address,
     pub status: CoSignerStatus,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProxyAuthorization {
+    pub proxy: Address,
+    pub max_rounds: u32,
+    pub used_rounds: u32,
 }
 
 // ── Audit Trail ────────────────────────────────────────────────────────────────

@@ -92,6 +92,10 @@ const IDEMPOTENCY_KEY_BUMP_AMOUNT: u32 = 17_280;
 const DEFAULT_MIN_COLLATERAL: i128 = 1_000_000; // 1 USDC (7 decimals)
 /// Default maximum tip: 3000 bps = 30% of base payment amount (#265)
 const DEFAULT_MAX_TIP_BPS: u32 = 3_000;
+/// Default maximum additional ledgers per extension (≈30 days at 5s/ledger)
+const DEFAULT_MAX_EXTENSION_LEDGERS: u32 = 30 * 24 * 60 * 60 / 5;
+/// Default maximum number of extensions per payment
+const DEFAULT_MAX_EXTENSIONS: u32 = 3;
 
 #[contracterror]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -132,6 +136,20 @@ pub enum Error {
     TipExceedsMaxBps = 19,
     /// KYB verification required but merchant not verified (#310)
     KYBVerificationRequired = 25,
+    /// retry_failed_debit called before back-off interval has elapsed (#329)
+    RetryNotDue = 25,
+    /// Failed debit record not found (#329)
+    DebitRecordNotFound = 26,
+    /// Debit record is already abandoned; no further retries (#329)
+    DebitAlreadyAbandoned = 27,
+    /// Debit record already succeeded; no retry needed (#329)
+    DebitAlreadySucceeded = 28,
+    /// Payment is not in a pending state and cannot be extended
+    InvalidPaymentStatus = 25,
+    /// Maximum number of extensions reached for this payment
+    MaxExtensionsReached = 26,
+    /// Additional ledgers exceed the maximum allowed per extension
+    MaxExtensionLedgersExceeded = 27,
 }
 
 /// Per-merchant withdrawal rate limit config (#231).
@@ -319,6 +337,8 @@ pub struct Payment {
     pub external_id: Option<BytesN<32>>,
     /// Whether this payment accepts a customer tip at settlement time (#265).
     pub tipping_enabled: bool,
+    /// Number of times this payment's expiry has been extended.
+    pub extension_count: u32,
 }
 
 #[contracttype]
@@ -686,9 +706,59 @@ pub enum DataKey2 {
     MerchantKYB(Address),
     /// Instance: KYB enforcement flag (#310)
     KYBEnforcementEnabled,
+    /// #329: counter for failed debit records
+    FailedDebitCounter,
+    /// #329: failed debit record keyed by record ID
+    FailedDebit(u32),
+    /// #329: admin-configurable retry back-off config
+    RetryConfig,
+    /// Instance: maximum additional ledgers per extension
+    MaxExtensionLedgers,
+    /// Instance: maximum number of extensions per payment
+    MaxExtensions,
 }
 
 mod events;
+
+// ── #329: Failed Auto-Debit Retry Queue ───────────────────────────────────────
+
+/// Status of a failed debit record.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailedDebitStatus {
+    Pending = 0,
+    Succeeded = 1,
+    Abandoned = 2,
+}
+
+/// Stored record of a failed merchant-pull debit attempt.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FailedDebitRecord {
+    pub id: u32,
+    pub plan_id: u32,
+    pub merchant: Address,
+    pub customer: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub attempt_number: u32,
+    pub next_retry_ledger: u64,
+    pub status: FailedDebitStatus,
+    pub created_at: u64,
+}
+
+/// Admin-configurable exponential back-off settings for the retry queue.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetryConfig {
+    pub base_retry_interval: u64,
+    pub max_retry_interval: u64,
+    pub max_retry_attempts: u32,
+}
+
+const DEFAULT_BASE_RETRY_INTERVAL: u64 = 100;
+const DEFAULT_MAX_RETRY_INTERVAL: u64 = 3_200;
+const DEFAULT_MAX_RETRY_ATTEMPTS: u32 = 5;
 
 /// #216: Recurring invoice schedule.
 #[contracttype]
@@ -754,6 +824,12 @@ impl AhjoorPaymentsContract {
         env.storage()
             .instance()
             .set(&DataKey::FeeTiers, &Vec::<FeeTier>::new(&env));
+        env.storage()
+            .instance()
+            .set(&DataKey2::MaxExtensionLedgers, &DEFAULT_MAX_EXTENSION_LEDGERS);
+        env.storage()
+            .instance()
+            .set(&DataKey2::MaxExtensions, &DEFAULT_MAX_EXTENSIONS);
 
         env.storage()
             .instance()
@@ -971,6 +1047,7 @@ impl AhjoorPaymentsContract {
             // // release_condition: None,
             external_id: None,
             tipping_enabled: false,
+            extension_count: 0,
         };
 
         // Persistent: per-payment record with individual TTL
@@ -1091,6 +1168,7 @@ impl AhjoorPaymentsContract {
                 // release_condition: None,
                 external_id: None,
                 tipping_enabled: false,
+                extension_count: 0,
             };
 
             // Persistent: per-payment record with individual TTL
@@ -1646,6 +1724,7 @@ impl AhjoorPaymentsContract {
                 // release_condition: None,
                 external_id: None,
                 tipping_enabled: false,
+                extension_count: 0,
             };
 
             env.storage()
@@ -1767,6 +1846,7 @@ impl AhjoorPaymentsContract {
             // release_condition: None,
             external_id: None,
             tipping_enabled: false,
+            extension_count: 0,
         };
 
         env.storage()
@@ -2024,6 +2104,123 @@ impl AhjoorPaymentsContract {
         env.storage()
             .instance()
             .set(&DataKey::SlippageConfig, &SlippageConfig { default_bps, min_bps, max_bps });
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Admin updates the maximum allowed additional ledgers per extension and max number of extensions.
+    pub fn update_extension_config(
+        env: Env,
+        admin: Address,
+        max_extension_ledgers: u32,
+        max_extensions: u32,
+    ) {
+        Self::require_not_paused(&env);
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can update extension config");
+        }
+        if max_extension_ledgers == 0 {
+            panic!("max_extension_ledgers must be positive");
+        }
+        if max_extensions == 0 {
+            panic!("max_extensions must be positive");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey2::MaxExtensionLedgers, &max_extension_ledgers);
+        env.storage()
+            .instance()
+            .set(&DataKey2::MaxExtensions, &max_extensions);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Returns the current extension config.
+    pub fn get_extension_config(env: Env) -> (u32, u32) {
+        let max_extension_ledgers: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey2::MaxExtensionLedgers)
+            .unwrap_or(DEFAULT_MAX_EXTENSION_LEDGERS);
+        let max_extensions: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey2::MaxExtensions)
+            .unwrap_or(DEFAULT_MAX_EXTENSIONS);
+        (max_extension_ledgers, max_extensions)
+    }
+
+    /// Merchant extends a pending payment's expiry by additional_ledgers.
+    /// additional_ledgers must not exceed max_extension_ledgers.
+    /// A payment can be extended up to max_extensions times.
+    pub fn extend_payment_expiry(env: Env, merchant: Address, payment_id: u32, additional_ledgers: u32) {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+
+        let mut payment: Payment = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Payment(payment_id))
+            .expect("Payment not found");
+
+        if payment.merchant != merchant {
+            panic!("Only the payment merchant can extend expiry");
+        }
+
+        if payment.status != PaymentStatus::Pending {
+            panic_with_error!(&env, Error::InvalidPaymentStatus);
+        }
+
+        let (max_extension_ledgers, max_extensions) = Self::get_extension_config(&env);
+
+        if additional_ledgers > max_extension_ledgers {
+            panic_with_error!(&env, Error::MaxExtensionLedgersExceeded);
+        }
+
+        if payment.extension_count >= max_extensions {
+            panic_with_error!(&env, Error::MaxExtensionsReached);
+        }
+
+        // Calculate new expiry: use ledger timestamp + additional ledgers * 5s (or just add additional_ledgers as seconds? Wait, wait - wait, the existing code uses timestamp in seconds for expires_at! Wait a second, let's check that!
+        // Wait in create_payment_with_expiry, expires_at is set to now + timeout, where timeout is in seconds! Oh, but the user's issue says "additional_ledgers"! Hmm, what's the right approach here? Let's check how other parts of the codebase handle ledgers vs time!
+        // Wait let's check: the default max extension ledgers is 30 days, which at 5s/ledger is 30 * 24 * 60 * 60 /5 = 518400 ledgers. But if expires_at is stored in seconds, then 1 ledger = 5 seconds, so additional_ledgers * 5 seconds!
+        // Wait let's check the rest of the codebase to confirm!
+        // Wait let's check the existing code for expires_at usage! For example, how is a payment considered expired?
+        // Let's look for expire_payment or similar!
+        let now = env.ledger().timestamp();
+        // Assuming 1 ledger is 5 seconds (common in Stellar Soroban), but wait - actually, maybe the user intended additional_ledgers to mean additional seconds? Wait, let's check the issue description again! Wait the issue says:
+        // "merchant calls extend_payment_expiry(payment_id, additional_ledgers: u32) on a Pending payment before it expires, the contract advances expiry_ledger by additional_ledgers."
+        // But wait in our current code, we don't have expiry_ledger - we have expires_at which is a timestamp in seconds! Oh! Wait let's check the existing codebase to see if there's an expiry_ledger field anywhere!
+        // Wait let's search the codebase!
+        // Wait let's look for "expiry" in lib.rs!
+        // Wait let's search for "expire" in lib.rs!
+        // Let's check for how payments are expired!
+        // Let's keep reading lib.rs from where we left off!
+
+        // Okay, so expires_at is a timestamp in seconds! So how do we handle additional_ledgers? Let's check if the codebase has a way to convert ledgers to time, or if maybe we should just treat additional_ledgers as seconds? Wait let's check the DEFAULT_MAX_EXTENSION_LEDGERS we set earlier: we set it to 30 days in seconds divided by 5, assuming 5s per ledger! So let's multiply additional_ledgers by 5 seconds to get the additional time!
+        let additional_seconds = additional_ledgers as u64 * 5;
+        payment.expires_at = payment.expires_at.checked_add(additional_seconds).expect("Expiry overflow");
+        payment.extension_count += 1;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Payment(payment_id), &payment);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Payment(payment_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_payment_expiry_extended(&env, payment_id, payment.expires_at, payment.extension_count);
+
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
@@ -6860,6 +7057,360 @@ impl AhjoorPaymentsContract {
             .unwrap_or(DEFAULT_MAX_TIP_BPS)
     }
 
+    // ── #329: Failed Auto-Debit Retry Queue ───────────────────────────────────
+
+    /// Admin configures the retry back-off schedule.
+    /// `base_retry_interval`: ledgers before first retry (default 100).
+    /// `max_retry_interval`: back-off cap in ledgers (default 3 200).
+    /// `max_retry_attempts`: maximum retry attempts before abandonment (default 5).
+    pub fn set_retry_config(
+        env: Env,
+        admin: Address,
+        base_retry_interval: u64,
+        max_retry_interval: u64,
+        max_retry_attempts: u32,
+    ) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can set retry config");
+        }
+        if base_retry_interval == 0 {
+            panic!("base_retry_interval must be positive");
+        }
+        if max_retry_interval < base_retry_interval {
+            panic!("max_retry_interval must be >= base_retry_interval");
+        }
+        if max_retry_attempts == 0 {
+            panic!("max_retry_attempts must be at least 1");
+        }
+        let cfg = RetryConfig {
+            base_retry_interval,
+            max_retry_interval,
+            max_retry_attempts,
+        };
+        env.storage().persistent().set(&DataKey2::RetryConfig, &cfg);
+        env.storage().persistent().extend_ttl(
+            &DataKey2::RetryConfig,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Merchant initiates a pull-payment from a pre-approved customer allowance.
+    /// If the customer's balance is sufficient the payment settles immediately.
+    /// On insufficient balance the contract stores a `FailedDebitRecord` and
+    /// emits `DebitFailed` instead of reverting, returning the new record ID.
+    pub fn initiate_allowed_payment(
+        env: Env,
+        merchant: Address,
+        customer: Address,
+        token: Address,
+        amount: i128,
+        plan_id: u32,
+    ) -> u32 {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+        if amount <= 0 {
+            panic!("amount must be positive");
+        }
+        Self::require_token_allowed(&env, &token);
+        Self::require_merchant_approved(&env, &merchant);
+
+        let cfg: RetryConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::RetryConfig)
+            .unwrap_or(RetryConfig {
+                base_retry_interval: DEFAULT_BASE_RETRY_INTERVAL,
+                max_retry_interval: DEFAULT_MAX_RETRY_INTERVAL,
+                max_retry_attempts: DEFAULT_MAX_RETRY_ATTEMPTS,
+            });
+
+        let client = token::Client::new(&env, &token);
+        let result = client.try_transfer_from(
+            &env.current_contract_address(),
+            &customer,
+            &merchant,
+            &amount,
+        );
+
+        let record_id: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::FailedDebitCounter)
+            .unwrap_or(0u32)
+            + 1;
+        env.storage()
+            .persistent()
+            .set(&DataKey2::FailedDebitCounter, &record_id);
+        env.storage().persistent().extend_ttl(
+            &DataKey2::FailedDebitCounter,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        if result.is_ok() {
+            // Payment succeeded — store as a Succeeded record for auditing
+            let rec = FailedDebitRecord {
+                id: record_id,
+                plan_id,
+                merchant: merchant.clone(),
+                customer: customer.clone(),
+                token: token.clone(),
+                amount,
+                attempt_number: 1,
+                next_retry_ledger: 0,
+                status: FailedDebitStatus::Succeeded,
+                created_at: env.ledger().timestamp(),
+            };
+            env.storage().persistent().set(&DataKey2::FailedDebit(record_id), &rec);
+            env.storage().persistent().extend_ttl(
+                &DataKey2::FailedDebit(record_id),
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+        } else {
+            // Insufficient balance — store pending record and emit DebitFailed
+            let next_retry_ledger =
+                (env.ledger().sequence() as u64) + cfg.base_retry_interval;
+            let rec = FailedDebitRecord {
+                id: record_id,
+                plan_id,
+                merchant: merchant.clone(),
+                customer: customer.clone(),
+                token: token.clone(),
+                amount,
+                attempt_number: 1,
+                next_retry_ledger,
+                status: FailedDebitStatus::Pending,
+                created_at: env.ledger().timestamp(),
+            };
+            env.storage().persistent().set(&DataKey2::FailedDebit(record_id), &rec);
+            env.storage().persistent().extend_ttl(
+                &DataKey2::FailedDebit(record_id),
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+            events::emit_debit_failed(
+                &env,
+                record_id,
+                plan_id,
+                1,
+                next_retry_ledger,
+            );
+        }
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        record_id
+    }
+
+    /// Retry a failed debit. Enforces the exponential back-off schedule.
+    /// Returns `RetryNotDue` if the back-off interval has not elapsed.
+    /// On max attempts the record is moved to `AbandonedDebit` status.
+    pub fn retry_failed_debit(env: Env, record_id: u32) {
+        Self::require_not_paused(&env);
+
+        let mut rec: FailedDebitRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::FailedDebit(record_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::DebitRecordNotFound));
+
+        if rec.status == FailedDebitStatus::Abandoned {
+            panic_with_error!(&env, Error::DebitAlreadyAbandoned);
+        }
+        if rec.status == FailedDebitStatus::Succeeded {
+            panic_with_error!(&env, Error::DebitAlreadySucceeded);
+        }
+
+        let current_ledger = env.ledger().sequence() as u64;
+        if current_ledger < rec.next_retry_ledger {
+            panic_with_error!(&env, Error::RetryNotDue);
+        }
+
+        let cfg: RetryConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::RetryConfig)
+            .unwrap_or(RetryConfig {
+                base_retry_interval: DEFAULT_BASE_RETRY_INTERVAL,
+                max_retry_interval: DEFAULT_MAX_RETRY_INTERVAL,
+                max_retry_attempts: DEFAULT_MAX_RETRY_ATTEMPTS,
+            });
+
+        let client = token::Client::new(&env, &rec.token);
+        let result = client.try_transfer_from(
+            &env.current_contract_address(),
+            &rec.customer,
+            &rec.merchant,
+            &rec.amount,
+        );
+
+        if result.is_ok() {
+            rec.status = FailedDebitStatus::Succeeded;
+            env.storage().persistent().set(&DataKey2::FailedDebit(record_id), &rec);
+            env.storage().persistent().extend_ttl(
+                &DataKey2::FailedDebit(record_id),
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+            events::emit_debit_retry_succeeded(&env, record_id, rec.plan_id, rec.amount);
+        } else {
+            rec.attempt_number += 1;
+            if rec.attempt_number > cfg.max_retry_attempts {
+                rec.status = FailedDebitStatus::Abandoned;
+                env.storage().persistent().set(&DataKey2::FailedDebit(record_id), &rec);
+                env.storage().persistent().extend_ttl(
+                    &DataKey2::FailedDebit(record_id),
+                    PERSISTENT_LIFETIME_THRESHOLD,
+                    PERSISTENT_BUMP_AMOUNT,
+                );
+                events::emit_debit_abandoned(&env, record_id, rec.plan_id);
+            } else {
+                // Double the back-off, capped at max_retry_interval
+                let raw_interval =
+                    cfg.base_retry_interval
+                        .saturating_mul(1u64.checked_shl((rec.attempt_number - 1).min(63) as u32).unwrap_or(u64::MAX));
+                let interval = raw_interval.min(cfg.max_retry_interval);
+                rec.next_retry_ledger = current_ledger + interval;
+                env.storage().persistent().set(&DataKey2::FailedDebit(record_id), &rec);
+                env.storage().persistent().extend_ttl(
+                    &DataKey2::FailedDebit(record_id),
+                    PERSISTENT_LIFETIME_THRESHOLD,
+                    PERSISTENT_BUMP_AMOUNT,
+                );
+                events::emit_debit_failed(
+                    &env,
+                    record_id,
+                    rec.plan_id,
+                    rec.attempt_number,
+                    rec.next_retry_ledger,
+                );
+            }
+        }
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Customer triggers an early retry regardless of the back-off schedule,
+    /// e.g. after topping up their wallet.
+    pub fn trigger_early_retry(env: Env, customer: Address, record_id: u32) {
+        Self::require_not_paused(&env);
+        customer.require_auth();
+
+        let mut rec: FailedDebitRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::FailedDebit(record_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::DebitRecordNotFound));
+
+        if rec.customer != customer {
+            panic!("Only the debited customer may trigger an early retry");
+        }
+        if rec.status == FailedDebitStatus::Abandoned {
+            panic_with_error!(&env, Error::DebitAlreadyAbandoned);
+        }
+        if rec.status == FailedDebitStatus::Succeeded {
+            panic_with_error!(&env, Error::DebitAlreadySucceeded);
+        }
+
+        let cfg: RetryConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::RetryConfig)
+            .unwrap_or(RetryConfig {
+                base_retry_interval: DEFAULT_BASE_RETRY_INTERVAL,
+                max_retry_interval: DEFAULT_MAX_RETRY_INTERVAL,
+                max_retry_attempts: DEFAULT_MAX_RETRY_ATTEMPTS,
+            });
+
+        let client = token::Client::new(&env, &rec.token);
+        let result = client.try_transfer_from(
+            &env.current_contract_address(),
+            &rec.customer,
+            &rec.merchant,
+            &rec.amount,
+        );
+
+        if result.is_ok() {
+            rec.status = FailedDebitStatus::Succeeded;
+            env.storage().persistent().set(&DataKey2::FailedDebit(record_id), &rec);
+            env.storage().persistent().extend_ttl(
+                &DataKey2::FailedDebit(record_id),
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+            events::emit_debit_retry_succeeded(&env, record_id, rec.plan_id, rec.amount);
+        } else {
+            rec.attempt_number += 1;
+            if rec.attempt_number > cfg.max_retry_attempts {
+                rec.status = FailedDebitStatus::Abandoned;
+                env.storage().persistent().set(&DataKey2::FailedDebit(record_id), &rec);
+                env.storage().persistent().extend_ttl(
+                    &DataKey2::FailedDebit(record_id),
+                    PERSISTENT_LIFETIME_THRESHOLD,
+                    PERSISTENT_BUMP_AMOUNT,
+                );
+                events::emit_debit_abandoned(&env, record_id, rec.plan_id);
+            } else {
+                let raw_interval =
+                    cfg.base_retry_interval
+                        .saturating_mul(1u64.checked_shl((rec.attempt_number - 1).min(63) as u32).unwrap_or(u64::MAX));
+                let interval = raw_interval.min(cfg.max_retry_interval);
+                rec.next_retry_ledger = (env.ledger().sequence() as u64) + interval;
+                env.storage().persistent().set(&DataKey2::FailedDebit(record_id), &rec);
+                env.storage().persistent().extend_ttl(
+                    &DataKey2::FailedDebit(record_id),
+                    PERSISTENT_LIFETIME_THRESHOLD,
+                    PERSISTENT_BUMP_AMOUNT,
+                );
+                events::emit_debit_failed(
+                    &env,
+                    record_id,
+                    rec.plan_id,
+                    rec.attempt_number,
+                    rec.next_retry_ledger,
+                );
+            }
+        }
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Read a failed debit record by ID.
+    pub fn get_failed_debit(env: Env, record_id: u32) -> FailedDebitRecord {
+        env.storage()
+            .persistent()
+            .get(&DataKey2::FailedDebit(record_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::DebitRecordNotFound))
+    }
+
+    /// Read the current retry configuration.
+    pub fn get_retry_config(env: Env) -> RetryConfig {
+        env.storage()
+            .persistent()
+            .get(&DataKey2::RetryConfig)
+            .unwrap_or(RetryConfig {
+                base_retry_interval: DEFAULT_BASE_RETRY_INTERVAL,
+                max_retry_interval: DEFAULT_MAX_RETRY_INTERVAL,
+                max_retry_attempts: DEFAULT_MAX_RETRY_ATTEMPTS,
+            })
+    }
+
 }
 
 #[cfg(test)]
@@ -6888,5 +7439,7 @@ mod test_referral;
 mod test_dynamic_settlement;
 #[cfg(test)]
 mod test_spending_limit;
+#[cfg(test)]
+mod test_retry_queue;
 
 pub use events::*;

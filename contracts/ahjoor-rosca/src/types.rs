@@ -318,6 +318,46 @@ pub enum DataKey3 {
     TreasuryRoundProposal(u32), // (round_index) → TreasuryRoundProposal
     /// #314: Treasury round votes per member
     TreasuryRoundVotes(u32, Address), // (round_index, member) → bool
+    // #330: Contribution Delegation
+    ContribDelegations,      // Map<Address, ContribDelegationRecord> — member → delegation
+    // #331: Group Split
+    SplitProposalCounter,    // u32
+    SplitProposals,          // Map<u32, SplitProposal>
+    SplitConfirmationWindow, // u32 — ledgers members have to confirm
+}
+
+// ── #330: Contribution Delegation ────────────────────────────────────────────
+
+/// Delegation record granting a proxy the right to act for a member.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContribDelegationRecord {
+    pub proxy: Address,
+    pub expiry_ledger: u64,
+}
+
+// ── #331: Group Split ─────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[contracttype]
+pub enum SplitProposalStatus {
+    Pending = 0,
+    Executed = 1,
+    Expired = 2,
+}
+
+/// Proposal to divide one ROSCA group into two independent sub-groups.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SplitProposal {
+    pub id: u32,
+    pub group_a_members: Vec<Address>,
+    pub group_b_members: Vec<Address>,
+    pub split_reason_hash: BytesN<32>,
+    pub confirmations: Vec<Address>,
+    pub status: SplitProposalStatus,
+    pub created_at_ledger: u32,
+    pub expiry_ledger: u32,
 }
 
 /// Persistent storage keys — kept separate because DataKey was hitting
@@ -439,6 +479,8 @@ pub enum GroupStatus {
     Dissolved = 1,
     /// Group was merged into another group; all further interactions are rejected.
     Merged = 2,
+    /// Group was split into two sub-groups; no further operations permitted.
+    Split = 3,
 }
 
 #[contracttype]

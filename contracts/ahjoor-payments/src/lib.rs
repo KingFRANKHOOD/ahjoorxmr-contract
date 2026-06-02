@@ -167,29 +167,29 @@ pub enum Error {
     /// Cooling-off period exceeds maximum allowed (#309)
     CoolingOffExceedsMax = 29,
     /// KYB verification required but merchant not verified (#310)
-    KYBVerificationRequired = 25,
+    KYBVerificationRequired = 33,
     /// retry_failed_debit called before back-off interval has elapsed (#329)
-    RetryNotDue = 25,
+    RetryNotDue = 34,
     /// Failed debit record not found (#329)
-    DebitRecordNotFound = 26,
+    DebitRecordNotFound = 35,
     /// Debit record is already abandoned; no further retries (#329)
-    /// Customer is blocked by merchant
-    CustomerBlocked = 50,
-    DebitAlreadyAbandoned = 27,
+    DebitAlreadyAbandoned = 36,
     /// Debit record already succeeded; no retry needed (#329)
-    DebitAlreadySucceeded = 28,
+    DebitAlreadySucceeded = 37,
     /// Payment is not in a pending state and cannot be extended
-    InvalidPaymentStatus = 25,
+    InvalidPaymentStatus = 38,
     /// Maximum number of extensions reached for this payment
-    MaxExtensionsReached = 26,
+    MaxExtensionsReached = 39,
     /// Additional ledgers exceed the maximum allowed per extension
-    MaxExtensionLedgersExceeded = 27,
+    MaxExtensionLedgersExceeded = 40,
     /// Subscription pause count exceeded (#327)
     PauseCountExceeded = 30,
     /// Unauthorized to pause subscription (#327)
     UnauthorizedPause = 31,
     /// Merchant refund reserve is below the configured minimum (#334)
     InsufficientMerchantReserve = 32,
+    /// Customer is blocked by merchant
+    CustomerBlocked = 50,
 }
 
 /// Per-merchant withdrawal rate limit config (#231).
@@ -839,8 +839,8 @@ pub enum DataKey {
 }
 
 /// Overflow storage keys — split from DataKey because #[contracttype] is bounded to 50 variants.
-#[derive(Clone)]
 #[contracttype]
+#[derive(Clone)]
 pub enum DataKey2 {
     /// Persistent: per-payment approval state
     ApprovalState(u32),
@@ -4446,6 +4446,167 @@ impl AhjoorPaymentsContract {
         env.storage()
             .persistent()
             .get(&DataKey::MerchantNotificationKey(merchant))
+    }
+
+    // =========================================================================
+    // Notification Key Rotation (#377)
+    // =========================================================================
+
+    /// Rotate notification key with overlap window for backward-compatible decryption.
+    /// Sets old key's valid_until to now + overlap_window, adds new key with valid_from = now.
+    pub fn rotate_notification_key(
+        env: Env,
+        merchant: Address,
+        new_key: Bytes,
+    ) {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+
+        if new_key.len() > MAX_NOTIFICATION_KEY_LEN {
+            panic!("Notification key exceeds maximum length of 128 bytes");
+        }
+
+        if new_key.is_empty() {
+            panic!("Notification key cannot be empty");
+        }
+
+        let now = env.ledger().timestamp();
+        let overlap_window: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey2::NotificationKeyRotationConfig)
+            .unwrap_or(DEFAULT_KEY_OVERLAP_WINDOW_SECONDS);
+        let overlap_until = now + overlap_window;
+
+        // Get current key history or create new
+        let mut history: soroban_sdk::Vec<NotificationKeyEntry> = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::NotificationKeyHistory(merchant.clone()))
+            .unwrap_or(soroban_sdk::Vec::new(&env));
+
+        // Get current active key (if exists)
+        let old_key: Option<Bytes> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerchantNotificationKey(merchant.clone()));
+
+        let old_key_hash = if let Some(ref key) = old_key {
+            // Set old key's valid_until
+            let old_entry = NotificationKeyEntry {
+                key: key.clone(),
+                valid_from: 0, // Find actual valid_from from history or use 0
+                valid_until: overlap_until,
+            };
+            history.push_back(old_entry);
+            env.crypto().sha256(key)
+        } else {
+            BytesN::from_array(&env, &[0u8; 32])
+        };
+
+        let new_key_hash = env.crypto().sha256(&new_key);
+
+        // Prune old keys if exceeds max history
+        while history.len() > MAX_NOTIFICATION_KEY_HISTORY {
+            history.remove(0);
+        }
+
+        // Store updated history
+        env.storage()
+            .persistent()
+            .set(&DataKey2::NotificationKeyHistory(merchant.clone()), &history);
+        env.storage()
+            .persistent()
+            .extend_ttl(
+                &DataKey2::NotificationKeyHistory(merchant.clone()),
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+
+        // Update active key
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerchantNotificationKey(merchant.clone()), &new_key);
+        env.storage().persistent().extend_ttl(
+            &DataKey::MerchantNotificationKey(merchant.clone()),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_notification_key_rotated(
+            &env,
+            merchant,
+            old_key_hash,
+            new_key_hash,
+            overlap_until,
+        );
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Get the active notification key (newest key with valid_from <= now).
+    pub fn get_active_notification_key(env: Env, merchant: Address) -> Option<Bytes> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MerchantNotificationKey(merchant))
+    }
+
+    /// Get notification key valid at a specific timestamp (historical lookup).
+    pub fn get_notification_key_at(
+        env: Env,
+        merchant: Address,
+        timestamp: u64,
+    ) -> Option<Bytes> {
+        // Check if timestamp is current or future -> return active key
+        let now = env.ledger().timestamp();
+        if timestamp >= now {
+            return env
+                .storage()
+                .persistent()
+                .get(&DataKey::MerchantNotificationKey(merchant.clone()));
+        }
+
+        // Look in history for key valid at timestamp
+        let history: Option<soroban_sdk::Vec<NotificationKeyEntry>> = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::NotificationKeyHistory(merchant));
+
+        if let Some(hist) = history {
+            for entry in hist.iter() {
+                if timestamp >= entry.valid_from && timestamp <= entry.valid_until {
+                    return Some(entry.key);
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Set the notification key rotation overlap window (admin only).
+    pub fn set_notification_key_overlap_window(
+        env: Env,
+        admin: Address,
+        window_seconds: u64,
+    ) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can set overlap window");
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey2::NotificationKeyRotationConfig, &window_seconds);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
     // --- Token Swap Functions ---
@@ -8405,6 +8566,104 @@ impl AhjoorPaymentsContract {
     }
 
     // =========================================================================
+    // Tip Split Configuration (#370)
+    // =========================================================================
+
+    /// Configure tip split allocation for a merchant.
+    /// Validates that basis points sum to exactly 10,000 and beneficiary count <= MAX_TIP_SPLIT_BENEFICIARIES.
+    pub fn set_tip_split_config(
+        env: Env,
+        merchant: Address,
+        caller: Address,
+        split_map: soroban_sdk::Vec<(Address, u32)>,
+    ) {
+        caller.require_auth();
+        
+        // Validate caller is merchant (in production, add admin override if needed)
+        if caller != merchant {
+            panic!("Only merchant can configure tip splits");
+        }
+        
+        // Validate non-empty
+        if split_map.is_empty() {
+            panic!("Tip split configuration cannot be empty");
+        }
+        
+        // Validate max beneficiaries
+        if split_map.len() > MAX_TIP_SPLIT_BENEFICIARIES {
+            panic!("Tip split beneficiaries exceed maximum allowed");
+        }
+        
+        // Validate total bps sum to 10,000
+        let mut total_bps: u32 = 0;
+        for entry in split_map.iter() {
+            total_bps = total_bps.checked_add(entry.1).expect("BPS overflow");
+        }
+        if total_bps != 10_000 {
+            panic!("Tip split basis points must sum to exactly 10,000");
+        }
+        
+        // Convert to Vec<TipSplitBeneficiary> and store
+        let mut beneficiaries: soroban_sdk::Vec<TipSplitBeneficiary> = soroban_sdk::Vec::new(&env);
+        for entry in split_map.iter() {
+            beneficiaries.push_back(TipSplitBeneficiary {
+                recipient: entry.0,
+                bps: entry.1,
+            });
+        }
+        
+        env.storage()
+            .persistent()
+            .set(&DataKey2::TipSplitConfig(merchant.clone()), &beneficiaries);
+        env.storage()
+            .persistent()
+            .extend_ttl(
+                &DataKey2::TipSplitConfig(merchant),
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+    }
+
+    /// Retrieve tip split configuration for a merchant.
+    /// Returns None if no configuration exists (fallback to default behavior).
+    pub fn get_tip_split_config(
+        env: Env,
+        merchant: Address,
+    ) -> Option<soroban_sdk::Vec<(Address, u32)>> {
+        let config: Option<soroban_sdk::Vec<TipSplitBeneficiary>> = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::TipSplitConfig(merchant));
+        
+        config.map(|beneficiaries| {
+            let mut result: soroban_sdk::Vec<(Address, u32)> = soroban_sdk::Vec::new(&env);
+            for b in beneficiaries.iter() {
+                result.push_back((b.recipient, b.bps));
+            }
+            result
+        })
+    }
+
+    /// Remove tip split configuration for a merchant.
+    /// Reverts to default behavior (100% to merchant).
+    pub fn remove_tip_split_config(
+        env: Env,
+        merchant: Address,
+        caller: Address,
+    ) {
+        caller.require_auth();
+        
+        // Validate caller is merchant (in production, add admin override if needed)
+        if caller != merchant {
+            panic!("Only merchant can remove tip split configuration");
+        }
+        
+        env.storage()
+            .persistent()
+            .remove(&DataKey2::TipSplitConfig(merchant));
+    }
+
+    // =========================================================================
     // Consent Records (#307): Zero-Amount Agreement Signing
     // =========================================================================
 
@@ -8790,103 +9049,6 @@ impl AhjoorPaymentsContract {
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
         next_id
-    }
-
-    #[cfg(any())]
-    /// Retry a failed debit. Enforces the exponential back-off schedule.
-    /// Returns `RetryNotDue` if the back-off interval has not elapsed.
-    /// On max attempts the record is moved to `AbandonedDebit` status.
-    pub fn retry_failed_debit(env: Env, record_id: u32) {
-        Self::require_not_paused(&env);
-
-        let mut rec: FailedDebitRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey2::FailedDebit(record_id))
-            .unwrap_or_else(|| panic_with_error!(&env, Error::DebitRecordNotFound));
-
-        if rec.status == FailedDebitStatus::Abandoned {
-            panic_with_error!(&env, Error::DebitAlreadyAbandoned);
-        }
-        if rec.status == FailedDebitStatus::Succeeded {
-            panic_with_error!(&env, Error::DebitAlreadySucceeded);
-        }
-
-        let current_ledger = env.ledger().sequence() as u64;
-        if current_ledger < rec.next_retry_ledger {
-            panic_with_error!(&env, Error::RetryNotDue);
-        }
-
-        let cfg: RetryConfig = env
-            .storage()
-            .persistent()
-            .get(&DataKey2::RetryConfig)
-            .unwrap_or(RetryConfig {
-                base_retry_interval: DEFAULT_BASE_RETRY_INTERVAL,
-                max_retry_interval: DEFAULT_MAX_RETRY_INTERVAL,
-                max_retry_attempts: DEFAULT_MAX_RETRY_ATTEMPTS,
-            });
-
-        let client = token::Client::new(&env, &rec.token);
-        let result = client.try_transfer_from(
-            &env.current_contract_address(),
-            &rec.customer,
-            &rec.merchant,
-            &rec.amount,
-        );
-
-        if result.is_ok() {
-            // Payment succeeded — store as a Succeeded record for auditing
-            let rec = FailedDebitRecord {
-                id: record_id,
-                plan_id,
-                merchant: merchant.clone(),
-                customer: customer.clone(),
-                token: token.clone(),
-                amount,
-                attempt_number: 1,
-                next_retry_ledger: 0,
-                status: FailedDebitStatus::Succeeded,
-                created_at: env.ledger().timestamp(),
-            };
-            env.storage()
-                .persistent()
-                .set(&DataKey2::FailedDebit(record_id), &rec);
-            env.storage().persistent().extend_ttl(
-                &DataKey2::FailedDebit(record_id),
-                PERSISTENT_LIFETIME_THRESHOLD,
-                PERSISTENT_BUMP_AMOUNT,
-            );
-        } else {
-            // Insufficient balance — store pending record and emit DebitFailed
-            let next_retry_ledger = (env.ledger().sequence() as u64) + cfg.base_retry_interval;
-            let rec = FailedDebitRecord {
-                id: record_id,
-                plan_id,
-                merchant: merchant.clone(),
-                customer: customer.clone(),
-                token: token.clone(),
-                amount,
-                attempt_number: 1,
-                next_retry_ledger,
-                status: FailedDebitStatus::Pending,
-                created_at: env.ledger().timestamp(),
-            };
-            env.storage()
-                .persistent()
-                .set(&DataKey2::FailedDebit(record_id), &rec);
-            env.storage().persistent().extend_ttl(
-                &DataKey2::FailedDebit(record_id),
-                PERSISTENT_LIFETIME_THRESHOLD,
-                PERSISTENT_BUMP_AMOUNT,
-            );
-            events::emit_debit_failed(&env, record_id, plan_id, 1, next_retry_ledger);
-        }
-
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
-        record_id
     }
 
     /// Retry a failed debit. Enforces the exponential back-off schedule.

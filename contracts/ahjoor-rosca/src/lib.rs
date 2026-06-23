@@ -1804,20 +1804,38 @@ impl AhjoorContract {
             .get(&DataKey3::AuctionBids)
             .unwrap_or(Vec::new(&env));
 
-        // Verify the bidder has an existing bid
+        let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        let token_client = token::Client::new(&env, &token_addr);
+
+        // Refund existing bid and build new bids list
         let mut found = false;
+        let mut new_bids: Vec<SlotBid> = Vec::new(&env);
         for bid in bids.iter() {
             if bid.bidder == bidder {
                 found = true;
-                break;
+                token_client.transfer(&env.current_contract_address(), &bidder, &bid.amount);
+            } else {
+                new_bids.push_back(bid);
             }
         }
         if !found {
             panic_with_error!(&env, ExtError2::NoBidFound);
         }
 
-        // Delegate to place_slot_bid which handles refund + re-deposit atomically
-        Self::place_slot_bid(env, bidder, desired_slot, new_bid_amount);
+        // Deposit new bid amount
+        token_client.transfer(&bidder, &env.current_contract_address(), &new_bid_amount);
+
+        // Record the new bid
+        new_bids.push_back(SlotBid {
+            bidder: bidder.clone(),
+            desired_slot,
+            amount: new_bid_amount,
+            placed_at: env.ledger().timestamp(),
+        });
+
+        env.storage().instance().set(&DataKey3::AuctionBids, &new_bids);
+        events::emit_slot_bid_placed(&env, 0, bidder, desired_slot, new_bid_amount);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
     /// Resolve the current slot auction.
@@ -3040,6 +3058,96 @@ impl AhjoorContract {
         env.storage().instance().set(&DataKey2::MinRoundDuration, &min_seconds);
         env.storage().instance().set(&DataKey2::MaxRoundDuration, &max_seconds);
         env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Admin manually penalises a specific defaulter from the current round's
+    /// defaulters list. Transfers the penalty amount from the member to the
+    /// contract and updates their default count and suspension status.
+    pub fn penalise_defaulter(env: Env, member: Address) {
+        internals::check_not_paused(&env);
+        internals::check_not_frozen(&env);
+
+        let defaulters: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Defaulters)
+            .unwrap_or(Vec::new(&env));
+        if !defaulters.contains(&member) {
+            panic_with_error!(&env, Error::NotADefaulter);
+        }
+
+        let penalty_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PenaltyAmount)
+            .unwrap_or(0);
+
+        if penalty_amount == 0 {
+            panic_with_error!(&env, Error::PenaltyDisabled);
+        }
+
+        Self::process_pending_penalties(&env);
+
+        let current_round: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentRound)
+            .unwrap_or(0);
+        let round_deadline: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey2::LastRoundDeadline)
+            .or(env.storage().instance().get(&DataKey::RoundDeadline))
+            .unwrap_or(0);
+        let grace_period_ledgers: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey2::GracePeriodLedgers)
+            .unwrap_or(0);
+        let grace_expires_at = round_deadline.saturating_add(grace_period_ledgers as u64);
+        let current_ledger = env.ledger().timestamp();
+
+        if current_ledger <= grace_expires_at {
+            let mut pending_penalties: Map<Address, u32> = env
+                .storage()
+                .instance()
+                .get(&DataKey2::PendingPenalties)
+                .unwrap_or(Map::new(&env));
+            pending_penalties.set(member.clone(), current_round);
+            env.storage()
+                .instance()
+                .set(&DataKey2::PendingPenalties, &pending_penalties);
+            events::emit_grace_period_warning(
+                &env,
+                member,
+                current_round,
+                grace_expires_at,
+            );
+            return;
+        }
+
+        Self::apply_penalty(&env, member, penalty_amount, current_round);
+    }
+
+    /// Admin sets the number of ledgers a co-signer has to fulfil a missed
+    /// contribution on behalf of a member before the penalty is applied.
+    pub fn set_co_signer_window(env: Env, admin: Address, window_ledgers: u32) {
+        internals::check_not_paused(&env);
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        if admin != stored_admin {
+            panic_with_error!(&env, Error::NotAMember);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey2::CoSignerWindowLedgers, &window_ledgers);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
     /// Member requests a grace-period deferral of their pending penalty.
@@ -5747,8 +5855,8 @@ impl AhjoorContract {
             .temporary()
             .set(&DataKey2::ExitRequests, &requests);
 
-        events::emit_exit_ok(&env, member.clone(), refund_amount);
         Self::update_credit_score_internal(&env, &member, Symbol::new(&env, "early_exit"));
+        events::emit_exit_ok(&env, member.clone(), refund_amount);
 
         // #352: Rebalance contributions after member departure (only if no waitlist fills the slot)
         let waitlist: Vec<(Address, u64)> = env
@@ -7556,12 +7664,15 @@ impl AhjoorContract {
             panic_with_error!(&env, Error::OnlyMembersAllowed);
         }
 
-        // Spam guard
+        // Spam guard — only applies if a previous snapshot exists
         let current_ledger = env.ledger().sequence();
-        let last_ledger: u32 = env.storage().persistent().get(&PersistentKey::LastSnapshotLedger).unwrap_or(0);
         let min_interval: u32 = env.storage().persistent().get(&PersistentKey::MinSnapshotIntervalLedgers).unwrap_or(0);
-        if min_interval > 0 && current_ledger < last_ledger.saturating_add(min_interval) {
-            panic_with_error!(&env, ExtError::SnapshotTooSoon);
+        if min_interval > 0 {
+            if let Some(last_ledger) = env.storage().persistent().get::<PersistentKey, u32>(&PersistentKey::LastSnapshotLedger) {
+                if current_ledger < last_ledger.saturating_add(min_interval) {
+                    panic_with_error!(&env, ExtError::SnapshotTooSoon);
+                }
+            }
         }
 
         // Collect current state

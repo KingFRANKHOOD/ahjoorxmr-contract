@@ -67,6 +67,7 @@ fn test_emergency_loan_grant() {
         grace_period_seconds: 0,
         auction_enabled: false,
         auction_window_ledgers: 0,
+        randomize_payout_order: false,
         reserve_enabled: true,
         reserve_contribution_bps: 200, // 2% surcharge
     };
@@ -113,6 +114,7 @@ fn test_emergency_loan_repayment() {
         grace_period_seconds: 0,
         auction_enabled: false,
         auction_window_ledgers: 0,
+        randomize_payout_order: false,
         reserve_enabled: true,
         reserve_contribution_bps: 200,
     };
@@ -159,6 +161,7 @@ fn test_duplicate_loan_rejected() {
         grace_period_seconds: 0,
         auction_enabled: false,
         auction_window_ledgers: 0,
+        randomize_payout_order: false,
         reserve_enabled: true,
         reserve_contribution_bps: 200,
     };

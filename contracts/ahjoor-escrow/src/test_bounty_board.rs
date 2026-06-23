@@ -13,7 +13,7 @@ fn create_token_contract<'a>(e: &Env, admin: &Address) -> token::StellarAssetCli
 fn advance_ledger(e: &Env, delta_secs: u64) {
     e.ledger().set(LedgerInfo {
         timestamp: e.ledger().timestamp().saturating_add(delta_secs),
-        protocol_version: 20,
+        protocol_version: 23,
         sequence_number: e.ledger().sequence(),
         network_id: Default::default(),
         base_reserve: 10,
@@ -118,6 +118,7 @@ fn test_create_bounty_past_claim_deadline() {
     client.initialize(&admin);
 
     let description_hash = BytesN::from_array(&env, &[1u8; 32]);
+    advance_ledger(&env, 1000); // ensure timestamp > 100 so subtraction doesn't overflow
     let current_time = env.ledger().timestamp();
 
     client.create_bounty(

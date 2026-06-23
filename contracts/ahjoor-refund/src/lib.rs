@@ -765,13 +765,13 @@ impl AhjoorRefundContract {
             .storage()
             .instance()
             .get(&DataKey::MerchantResponseWindow)
-            .unwrap_or(DEFAULT_MERCHANT_RESPONSE_WINDOW_LEDGERS);
+            .unwrap_or(0);
         let merch_response_deadline = env.ledger().sequence() + merchant_response_window;
         let auto_deadline_window: u32 = env
             .storage()
             .instance()
             .get(&DataKey2::MerchantResponseDeadlineLedgers)
-            .unwrap_or(DEFAULT_MERCHANT_RESPONSE_WINDOW_LEDGERS);
+            .unwrap_or(0);
 
         let primary_review_window: u32 = env
             .storage()
@@ -4778,7 +4778,7 @@ impl AhjoorRefundContract {
         // #355: Configurable exponential decay.
         // effective_score = stored_score * (factor_bps / 10_000) ^ periods_elapsed
         // Computed on read; the decayed value is NOT written back (no storage mutation on read).
-        if record.abuse_score > 0 && record.last_increment_ledger > 0 {
+        if record.abuse_score > 0 {
             let current_ledger = env.ledger().sequence() as u64;
             if current_ledger > record.last_increment_ledger {
                 let decay_period: u64 = env
@@ -4903,8 +4903,8 @@ impl AhjoorRefundContract {
         let mut record = old_record.clone();
         record.total_requests += 1;
 
-        // Rapid submission detection
-        if record.last_submission_ledger > 0
+        // Rapid submission detection (total_requests > 1 means at least one prior submission exists)
+        if record.total_requests > 1
             && current_seq.saturating_sub(record.last_submission_ledger) < rapid_window
         {
             record.rapid_submission_count += 1;

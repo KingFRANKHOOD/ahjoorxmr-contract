@@ -50,6 +50,9 @@ fn setup_waitlist<'a>() -> (Env, AhjoorContractClient<'a>, Address, Address, Vec
             grace_period_seconds: 0,
             auction_enabled: false,
             auction_window_ledgers: 0,
+            randomize_payout_order: false,
+            reserve_enabled: false,
+            reserve_contribution_bps: 0,
         },
         &None,
     );

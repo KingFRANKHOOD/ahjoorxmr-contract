@@ -85,6 +85,18 @@ pub struct PriceData {
     pub timestamp: u64,
 }
 
+/// Auto-renewal configuration for recurring service agreements.
+/// When provided at escrow creation, the escrow will automatically re-fund
+/// and restart at the end of each period for up to `max_renewals` cycles.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AutoRenewConfig {
+    /// Maximum number of automatic renewal cycles.
+    pub max_renewals: u32,
+    /// Duration of each renewal period in ledgers (used to compute new deadline).
+    pub renewal_interval_ledgers: u32,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EscrowCreateRequest {
@@ -106,7 +118,8 @@ pub struct EscrowCreateRequest {
     pub arbiter_fee_bps: Option<u32>,
     pub dispute_default_winner: Option<u32>, // 0 = Buyer, 1 = Seller
     /// Optional auto-renewal configuration for recurring service agreements.
-    pub auto_renew_config: Option<AutoRenewConfig>,
+    pub auto_renew_max_renewals: Option<u32>,
+    pub auto_renew_interval_ledgers: Option<u32>,
 }
 
 #[contracttype]
@@ -169,7 +182,8 @@ pub struct EscrowExtensions {
     /// #272: Optional inspector address for three-party quality gate.
     pub inspector: Option<Address>,
     /// Auto-renewal config (max_renewals + renewal_interval_ledgers); None = no auto-renewal.
-    pub auto_renew_config: Option<AutoRenewConfig>,
+    pub auto_renew_max_renewals: Option<u32>,
+    pub auto_renew_interval_ledgers: Option<u32>,
     /// Number of renewal cycles completed so far (incremented on each successful renewal).
     pub renewals_completed: u32,
 }
@@ -443,6 +457,8 @@ pub enum DataKey2 {
     InspectorRulingAppealed(u32),
     /// #376: ordered milestone schedule for a milestone-gated bounty (escrow_id → Vec<BountyMilestone>)
     BountyMilestones(u32),
+    /// Set to true once add_allowed_token is called; activates internal token allowlist enforcement.
+    AllowlistActivated,
 }
 
 /// #357: On-chain reputation record for an inspector.
@@ -566,18 +582,6 @@ pub struct BountyMilestone {
     pub status: BountyMilestoneStatus,
     /// Hash of the deliverable submitted by the solver (None until submitted).
     pub deliverable_hash: Option<BytesN<32>>,
-}
-
-/// Auto-renewal configuration for recurring service agreements.
-/// When provided at escrow creation, the escrow will automatically re-fund
-/// and restart at the end of each period for up to `max_renewals` cycles.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AutoRenewConfig {
-    /// Maximum number of automatic renewal cycles.
-    pub max_renewals: u32,
-    /// Duration of each renewal period in ledgers (used to compute new deadline).
-    pub renewal_interval_ledgers: u32,
 }
 
 /// #244: Pending seller role transfer proposal.
@@ -729,7 +733,9 @@ impl AhjoorEscrowContract {
             release_threshold_price: None,
             arbiter_fee_bps: None,
             dispute_default_winner: None,
-            auto_renew_config: None,
+            auto_renew_max_renewals: None,
+
+            auto_renew_interval_ledgers: None,
         };
 
         Self::create_escrow_core(&env, &buyer, request)
@@ -772,7 +778,9 @@ impl AhjoorEscrowContract {
             release_threshold_price: None,
             arbiter_fee_bps: None,
             dispute_default_winner: None,
-            auto_renew_config: None,
+            auto_renew_max_renewals: None,
+
+            auto_renew_interval_ledgers: None,
         };
 
         Self::create_escrow_core(&env, &buyer, request)
@@ -821,7 +829,8 @@ impl AhjoorEscrowContract {
             release_threshold_price: None,
             arbiter_fee_bps: None,
             dispute_default_winner: None,
-            auto_renew_config: Some(auto_renew_config),
+            auto_renew_max_renewals: Some(auto_renew_config.max_renewals),
+            auto_renew_interval_ledgers: Some(auto_renew_config.renewal_interval_ledgers),
         };
 
         Self::create_escrow_core(&env, &buyer, request)
@@ -871,7 +880,9 @@ impl AhjoorEscrowContract {
                     release_threshold_price: None,
                     arbiter_fee_bps: None,
                     dispute_default_winner: None,
-                    auto_renew_config: None,
+                    auto_renew_max_renewals: None,
+
+                    auto_renew_interval_ledgers: None,
                 },
             );
 
@@ -1186,7 +1197,8 @@ impl AhjoorEscrowContract {
             release_threshold_price,
             arbiter_fee_bps,
             dispute_default_winner,
-            auto_renew_config,
+            auto_renew_max_renewals,
+            auto_renew_interval_ledgers,
         } = request;
 
         if amount <= 0 {
@@ -1237,15 +1249,6 @@ impl AhjoorEscrowContract {
 
         // Token whitelist validation
         Self::require_token_allowed(&env, &token);
-
-        let is_allowed = env
-            .storage()
-            .instance()
-            .get(&DataKey::AllowedToken(token.clone()))
-            .unwrap_or(false);
-        if !is_allowed {
-            panic!("TokenNotAllowed");
-        }
 
         // Validate multi-party sellers if provided
         let resolved_sellers: Vec<(Address, u32)> = if sellers.is_empty() {
@@ -1315,7 +1318,8 @@ impl AhjoorEscrowContract {
                 collateral_amount: 0,
                 delivery_proof_hash: None,
                 inspector: None,
-                auto_renew_config,
+                auto_renew_max_renewals,
+                auto_renew_interval_ledgers,
                 renewals_completed: 0,
             },
             top_up_history: Vec::new(env),
@@ -1879,7 +1883,7 @@ impl AhjoorEscrowContract {
             panic!("Only buyer can cancel auto-renewal");
         }
 
-        if escrow.extensions.auto_renew_config.is_none() {
+        if escrow.extensions.auto_renew_max_renewals.is_none() {
             panic!("No AutoRenewConfig set on this escrow");
         }
 
@@ -2024,7 +2028,9 @@ impl AhjoorEscrowContract {
             release_threshold_price: None,
             arbiter_fee_bps: None,
             dispute_default_winner: None,
-            auto_renew_config: None,
+            auto_renew_max_renewals: None,
+
+            auto_renew_interval_ledgers: None,
         };
         let escrow_id = Self::create_escrow_core(&env, &buyer, request);
 
@@ -2435,14 +2441,17 @@ impl AhjoorEscrowContract {
     }
 
     /// Admin clears a resolution flag (after review) and allows finalization to proceed.
-    pub fn clear_resolution_flag(env: Env, escrow_id: u32) {
+    pub fn clear_resolution_flag(env: Env, admin: Address, escrow_id: u32) {
         Self::require_not_paused(&env);
-        let admin: Address = env
+        admin.require_auth();
+        let stored_admin: Address = env
             .storage()
             .instance()
             .get(&DataKey::Admin)
             .expect("Not initialized");
-        admin.require_auth();
+        if admin != stored_admin {
+            panic!("Only admin can clear resolution flags");
+        }
 
         if !env.storage().persistent().has(&DataKey2::ResolutionFlag(escrow_id)) {
             panic!("No flag to clear");
@@ -2948,15 +2957,6 @@ impl AhjoorEscrowContract {
 
         // Token whitelist validation
         Self::require_token_allowed(&env, &token);
-
-        let is_allowed = env
-            .storage()
-            .instance()
-            .get(&DataKey::AllowedToken(token.clone()))
-            .unwrap_or(false);
-        if !is_allowed {
-            panic!("TokenNotAllowed");
-        }
 
         env.storage().instance().set(&DataKey::InsuranceToken, &token);
         env.storage()
@@ -4033,7 +4033,9 @@ impl AhjoorEscrowContract {
             release_threshold_price: None,
             arbiter_fee_bps: None,
             dispute_default_winner: None,
-            auto_renew_config: None,
+            auto_renew_max_renewals: None,
+
+            auto_renew_interval_ledgers: None,
         };
         let escrow_id = Self::create_escrow_core(&env, &buyer, request);
         let lock_data = TimeLockData { unlock_at, beneficiary: beneficiary.clone(), claimed: false };
@@ -4179,6 +4181,9 @@ impl AhjoorEscrowContract {
         env.storage()
             .instance()
             .set(&DataKey::AllowedToken(token.clone()), &true);
+        env.storage()
+            .instance()
+            .set(&DataKey2::AllowlistActivated, &true);
         events::emit_token_allowlisted(&env, admin, token);
         env.storage()
             .instance()
@@ -4316,7 +4321,9 @@ impl AhjoorEscrowContract {
                 collateral_amount: 0,
                 delivery_proof_hash: None,
                 inspector: None,
-                auto_renew_config: None,
+                auto_renew_max_renewals: None,
+
+                auto_renew_interval_ledgers: None,
                 renewals_completed: 0,
             },
             top_up_history: Vec::new(&env),
@@ -4515,7 +4522,9 @@ impl AhjoorEscrowContract {
                 collateral_amount: 0,
                 delivery_proof_hash: None,
                 inspector: None,
-                auto_renew_config: None,
+                auto_renew_max_renewals: None,
+
+                auto_renew_interval_ledgers: None,
                 renewals_completed: 0,
             },
             top_up_history: Vec::new(&env),
@@ -5091,7 +5100,9 @@ impl AhjoorEscrowContract {
                 collateral_amount: 0,
                 delivery_proof_hash: None,
                 inspector: None,
-                auto_renew_config: None,
+                auto_renew_max_renewals: None,
+
+                auto_renew_interval_ledgers: None,
                 renewals_completed: 0,
             },
             top_up_history: Vec::new(&env),
@@ -5563,7 +5574,9 @@ impl AhjoorEscrowContract {
                 collateral_amount: 0,
                 delivery_proof_hash: None,
                 inspector: None,
-                auto_renew_config: None,
+                auto_renew_max_renewals: None,
+
+                auto_renew_interval_ledgers: None,
                 renewals_completed: 0,
             },
             top_up_history: Vec::new(&env),
@@ -6265,7 +6278,9 @@ impl AhjoorEscrowContract {
             release_threshold_price: None,
             arbiter_fee_bps: None,
             dispute_default_winner: None,
-            auto_renew_config: None,
+            auto_renew_max_renewals: None,
+
+            auto_renew_interval_ledgers: None,
         };
 
         let escrow_id = Self::create_escrow_core(&env, &buyer, request);
@@ -6474,6 +6489,24 @@ impl AhjoorEscrowContract {
             if !client.is_token_allowed_for_contract(&env.current_contract_address(), token) {
                 panic!("TokenNotAllowed");
             }
+        } else {
+            // Fall back to internal allowlist if it has been activated
+            let allowlist_active: bool = env
+                .storage()
+                .instance()
+                .get(&DataKey2::AllowlistActivated)
+                .unwrap_or(false);
+            if allowlist_active {
+                let is_allowed: bool = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::AllowedToken(token.clone()))
+                    .unwrap_or(false);
+                if !is_allowed {
+                    panic!("TokenNotAllowed");
+                }
+            }
+            // If allowlist not activated → allow all tokens (backward compatibility)
         }
     }
 
@@ -6633,7 +6666,7 @@ impl AhjoorEscrowContract {
 
     fn try_auto_renew(env: &Env, old_escrow_id: u32, source: &Escrow) {
         // ── New AutoRenewConfig path ──────────────────────────────────────────
-        if let Some(ref cfg) = source.extensions.auto_renew_config {
+        if let Some(max_renewals) = source.extensions.auto_renew_max_renewals {
             // Check if buyer has cancelled renewals for this escrow chain
             let cancelled: bool = env
                 .storage()
@@ -6647,7 +6680,7 @@ impl AhjoorEscrowContract {
             let renewals_completed = source.extensions.renewals_completed;
 
             // Enforce max_renewals cap
-            if renewals_completed >= cfg.max_renewals {
+            if renewals_completed >= max_renewals {
                 return;
             }
 
@@ -6675,7 +6708,7 @@ impl AhjoorEscrowContract {
 
             // Compute new deadline using renewal_interval_ledgers converted to seconds
             // (Soroban ledger ≈ 5 s; we store interval in ledgers but deadline is unix timestamp)
-            let interval_secs = (cfg.renewal_interval_ledgers as u64) * 5;
+            let interval_secs = (source.extensions.auto_renew_interval_ledgers.unwrap_or(0) as u64) * 5;
             let now = env.ledger().timestamp();
             let new_deadline = now + interval_secs;
 
@@ -6713,7 +6746,8 @@ impl AhjoorEscrowContract {
                     collateral_amount: 0,
                     delivery_proof_hash: source.extensions.delivery_proof_hash.clone(),
                     inspector: source.extensions.inspector.clone(),
-                    auto_renew_config: Some(cfg.clone()),
+                    auto_renew_max_renewals: Some(max_renewals),
+                    auto_renew_interval_ledgers: source.extensions.auto_renew_interval_ledgers,
                     renewals_completed: renewal_index,
                 },
                 top_up_history: Vec::new(env),
@@ -6833,7 +6867,9 @@ impl AhjoorEscrowContract {
                 collateral_amount: 0,
                 delivery_proof_hash: source.extensions.delivery_proof_hash.clone(),
                 inspector: source.extensions.inspector.clone(),
-                auto_renew_config: None,
+                auto_renew_max_renewals: None,
+
+                auto_renew_interval_ledgers: None,
                 renewals_completed: 0,
             },
             top_up_history: Vec::new(&env),
@@ -6976,7 +7012,9 @@ impl AhjoorEscrowContract {
                 release_threshold_price: None,
                 arbiter_fee_bps: None,
                 dispute_default_winner: None,
-                auto_renew_config: None,
+                auto_renew_max_renewals: None,
+
+                auto_renew_interval_ledgers: None,
             },
         );
         if required_collateral_bps > 0 {
@@ -7398,6 +7436,114 @@ impl AhjoorEscrowContract {
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
+    /// Seller initiates a role transfer to a new address.
+    /// Sets escrow status to AwaitingBuyerVetoDecision.
+    pub fn transfer_seller_role(env: Env, seller: Address, escrow_id: u32, new_seller: Address) {
+        Self::require_not_paused(&env);
+        seller.require_auth();
+        let mut escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("Escrow not found");
+        if escrow.seller != seller {
+            panic!("Only the current seller can initiate a transfer");
+        }
+        if escrow.status != EscrowStatus::Active {
+            panic!("Escrow must be active to transfer seller role");
+        }
+        let veto_window: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey2::SellerTransferVetoWindow)
+            .unwrap_or(200);
+        let veto_deadline = env.ledger().sequence() + veto_window;
+        let proposal = SellerTransferProposal {
+            original_seller: seller.clone(),
+            new_seller: new_seller.clone(),
+            veto_deadline,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey2::SellerTransferProposal(escrow_id), &proposal);
+        env.storage().persistent().extend_ttl(
+            &DataKey2::SellerTransferProposal(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        escrow.status = EscrowStatus::AwaitingBuyerVetoDecision;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(escrow_id), &escrow);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Escrow(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        events::emit_seller_transfer_proposed(&env, escrow_id, seller, new_seller, veto_deadline);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Buyer vetoes the seller transfer, refunding themselves and setting status to Refunded.
+    pub fn veto_seller_transfer(env: Env, buyer: Address, escrow_id: u32) {
+        Self::require_not_paused(&env);
+        buyer.require_auth();
+        let mut escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("Escrow not found");
+        if escrow.buyer != buyer {
+            panic!("Only the buyer can veto");
+        }
+        if escrow.status != EscrowStatus::AwaitingBuyerVetoDecision {
+            panic!("No pending seller transfer");
+        }
+        let amount = escrow.amount;
+        let token_client = token::Client::new(&env, &escrow.token);
+        token_client.transfer(&env.current_contract_address(), &buyer, &amount);
+        escrow.status = EscrowStatus::Refunded;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(escrow_id), &escrow);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Escrow(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        events::emit_seller_transfer_vetoed(&env, escrow_id, buyer, amount);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Admin sets the number of ledgers the buyer has to veto a seller transfer.
+    pub fn set_seller_transfer_veto_window(env: Env, admin: Address, window_ledgers: u32) {
+        Self::require_not_paused(&env);
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can set the veto window");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey2::SellerTransferVetoWindow, &window_ledgers);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Finalizes a pending seller transfer once the veto window has passed.
+    pub fn finalize_seller_transfer(env: Env, escrow_id: u32) {
+        Self::expire_seller_transfer_veto(env, escrow_id);
+    }
+
     /// Returns (avg_score_x100, total_ratings) for an address.
     /// avg_score_x100 = (total_score * 100) / count, or 0 if no ratings.
     pub fn get_reputation(env: Env, address: Address) -> (u32, u32) {
@@ -7472,7 +7618,9 @@ impl AhjoorEscrowContract {
             release_threshold_price: None,
             arbiter_fee_bps: None,
             dispute_default_winner: None,
-            auto_renew_config: None,
+            auto_renew_max_renewals: None,
+
+            auto_renew_interval_ledgers: None,
         };
         let escrow_id = Self::create_escrow_core(&env, &buyer, request);
 
